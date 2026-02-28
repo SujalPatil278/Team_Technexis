@@ -1,0 +1,188 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any
+
+from engine.profit_calc import get_net_realization
+from engine.map_logic import calculate_spatial_profit
+from engine.shock_analyzer import detect_market_shock, detect_volume_shock
+from integrations.mandi_api import fetch_mandi_prices
+from integrations.weather_api import fetch_district_weather
+
+app = FastAPI(title="AgriChain API", description="The Temporal Arbitrage Engine")
+
+# Configure CORS
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+from api.chat import router as chat_router, generate_vakeel_brief
+from api.user import router as user_router
+
+app.include_router(chat_router, prefix="/chat", tags=["AI Explanation"])
+app.include_router(user_router, prefix="/user", tags=["User Data Management"])
+
+class HarvestRequest(BaseModel):
+    crop: str = ""
+    location: dict
+    yield_est_quintals: float
+    base_spoilage_rate: float = 0.05 # 5% base spoilage
+    language: str = "en"
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "AgriChain backend is running."}
+
+@app.post("/recommendation")
+async def get_harvest_recommendation(data: HarvestRequest):
+    """
+    Core Decision Engine Endpoint.
+    1. Fetches weather and mandi info.
+    2. Runs profit calc and decay logic.
+    3. Runs shock analyzer for Black Swan events.
+    """
+    try:
+        # 1. Fetch Integration Data
+        weather_data = await fetch_district_weather(data.location)
+        mandi_response = await fetch_mandi_prices(data.crop, data.location, data.language)
+        primary_mandi = mandi_response["primary"]
+        regional_mandis = mandi_response["regional_options"]
+        
+        # 2. Risk & Shock Analysis (on Primary Mandi)
+        price_shock = detect_market_shock(primary_mandi["current_price"], primary_mandi["7_day_history"])
+        volume_shock = detect_volume_shock(primary_mandi["current_volume_quintals"], primary_mandi["average_volume_quintals"])
+        
+        # Determine if there's any active shock
+        active_shock = None
+        if price_shock["is_shock"]:
+            active_shock = price_shock
+        elif volume_shock["is_shock"]:
+            active_shock = volume_shock
+        elif weather_data["rain_probability_percent"] > 80:
+             active_shock = {
+                "status": "WEATHER_SHOCK",
+                "message": "Heavy rain > 80% probability in next 2 hours!",
+                "is_shock": True,
+                "pivot_advice": "EMERGENCY: Cover your produce immediately or delay transit!"
+            }
+
+        # 3. Spatial Profit Analysis (Map Logic)
+        temp_today = weather_data["temperature_c"]
+        humidity_today = weather_data["humidity_percent"]
+        soil_moisture_today = weather_data.get("soil_moisture_percent", 45.0) # Real satellite data
+        
+        # Calculate logistics and profit for ALL regional options
+        spatial_profits = calculate_spatial_profit(
+            crop=data.crop,
+            yield_est=data.yield_est_quintals,
+            temp_c=temp_today,
+            humidity=humidity_today,
+            available_mandis=regional_mandis
+        )
+        
+        best_overall_mandi = spatial_profits[0]
+        
+        dist = primary_mandi["distance_km"]
+        
+        # Calculate for TODAY (Assume 2 hours shelf/transit time to primary)
+        estimated_transit_hours = 2.0
+        profit_today = get_net_realization(
+            market_price=primary_mandi["current_price"],
+            crop_type=data.crop,
+            distance_km=dist,
+            temp_c=temp_today,
+            humidity=humidity_today,
+            hours_to_market=estimated_transit_hours,
+            yield_est=data.yield_est_quintals
+        )
+        
+        # Calculate for 48 HOURS (Assume 50 hours shelf/transit time total)
+        price_forecast_48h = primary_mandi["current_price"] * 1.05 
+        temp_forecast_48h = temp_today + 2.0 
+        
+        profit_48h = get_net_realization(
+            market_price=price_forecast_48h,
+            crop_type=data.crop,
+            distance_km=primary_mandi["distance_km"], # Forecast is usually for the nearest/default market
+            temp_c=temp_forecast_48h,
+            humidity=humidity_today,
+            hours_to_market=50.0,
+            yield_est=data.yield_est_quintals
+        )
+        
+        # 3.5 UNIFIED DECISION LOGIC: Pick the absolute BEST market today
+        # spatial_profits[0] is already sorted by total_net_profit descending
+        best_optimal_option = spatial_profits[0]
+        
+        # Promoting the BEST regional option to be our Primary recommendation baseline
+        profit_today = best_optimal_option["net_profit_per_quintal"]
+        total_profit_today = best_optimal_option["total_net_profit"]
+        best_mandi_name = best_optimal_option["mandi_name"]
+        dist_best = best_optimal_option["distance_km"]
+        
+        gross_rev = best_optimal_option["market_price"] * data.yield_est_quintals
+        logistics_cost = dist_best * 15.0 
+        spoilage_penalty = (best_optimal_option["quality_loss_pct"] / 100.0) * gross_rev
+        
+        # 4. Synthesize Final Recommendation & Routing Pivot
+        is_selling_optimal = profit_today >= profit_48h
+        status = "GREEN" if is_selling_optimal else "RED"
+        
+        pivot_mandi = None
+        
+        # Alternative Destination Discovery Trigger
+        if active_shock:
+            status = "RED" # Shocks always override to RED/WAIT for primary
+            
+            # Find the best alternative that IS NOT the primary mandi
+            for option in spatial_profits:
+                if option["mandi_name"] != primary_mandi["name"] and not option.get("is_dead_zone"):
+                    pivot_mandi = option
+                    break
+            
+            if pivot_mandi:
+                 active_shock["pivot_advice"] = f"EMERGENCY: Primary market crashed. Re-routing you to {pivot_mandi['mandi_name']} ({round(pivot_mandi['distance_km'], 1)}km). Estimated Net Profit: ₹{pivot_mandi['total_net_profit']}"
+                 active_shock["pivot_mandi"] = pivot_mandi
+            
+        recommendation = {
+            "status": status,
+            "net_realization_inr_per_quintal": round(profit_today, 2),
+            "total_net_profit": round(total_profit_today, 2),
+            "yield_quintals": data.yield_est_quintals,
+            "breakdown": {
+                "gross_revenue": round(gross_rev, 2),
+                "logistics_cost": round(logistics_cost, 2),
+                "spoilage_penalty": round(spoilage_penalty, 2),
+                "quality_loss_pct": round(best_optimal_option["quality_loss_pct"], 2)
+            },
+            "profit_forecast_48h": round(profit_48h, 2),
+            "best_mandi": f"{best_mandi_name} ({round(dist_best, 1)} km)",
+            "weather": weather_data,
+            "mandi_stats": {
+                "name": best_mandi_name,
+                "current_price": best_optimal_option["market_price"],
+                "distance_km": dist_best,
+                "quality_loss_pct": best_optimal_option["quality_loss_pct"]
+            },
+            "shock_alert": active_shock,
+            "regional_options": spatial_profits, # Send all map data for the Market Maps tab
+            "decay_metrics": {
+                "today_profit": round(profit_today, 2),
+                "future_profit": round(profit_48h, 2),
+                "profit_difference": round(profit_today - profit_48h, 2)
+            }
+        }
+        
+        # Add AI brief after recommendation is formed
+        recommendation["vakeel_brief"] = generate_vakeel_brief(recommendation, data.language)
+        
+        return recommendation
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

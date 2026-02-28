@@ -1,0 +1,206 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { GlassCard } from '@/components/glass-card';
+import { supabase } from '@/utils/supabase/client';
+import { auth } from '@/services/firebase';
+import { useLanguage } from '@/contexts/LanguageContext';
+
+export default function AccountsPage() {
+    const { t, n } = useLanguage();
+    const [loading, setLoading] = useState(true);
+    const [saving, setSaving] = useState(false);
+    const [profile, setProfile] = useState({
+        name: '',
+        phone: '',
+        crop: '',
+        land_size_acres: '',
+    });
+
+    // Simulate user fetch for demo/prototype purposes
+    useEffect(() => {
+        const fetchProfile = async () => {
+            try {
+                // In production, get phone from auth.currentUser.phoneNumber
+                const phone = auth.currentUser?.phoneNumber || localStorage.getItem('demo_phone') || "9999999999";
+                setProfile(prev => ({ ...prev, phone }));
+
+                const { data, error } = await supabase
+                    .from('profiles')
+                    .select('*')
+                    .eq('phone', phone)
+                    .single();
+
+                if (data && !error) {
+                    setProfile({
+                        name: data.name || '',
+                        phone: data.phone || '',
+                        crop: data.crop || '',
+                        land_size_acres: data.land_size_acres ? String(data.land_size_acres) : '',
+                    });
+                }
+            } catch (error) {
+                console.error("Error fetching profile:", error);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        fetchProfile();
+    }, []);
+
+    const handleDeleteData = async () => {
+        if (!window.confirm(t('confirmDelete' as any))) return;
+
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/user/purge`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone_number: profile.phone })
+            });
+
+            if (response.ok) {
+                alert(t('dataDeleted' as any));
+                await auth.signOut();
+                localStorage.removeItem('user_consent_dpdp');
+                window.location.href = '/login';
+            } else {
+                throw new Error("Failed to purge data");
+            }
+        } catch (error) {
+            console.error("Purge error:", error);
+            alert("Error: Could not complete erasure request.");
+        }
+    };
+
+    const handleSave = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSaving(true);
+
+        try {
+            const { error } = await supabase
+                .from('profiles')
+                .upsert({
+                    phone: profile.phone,
+                    name: profile.name,
+                    crop: profile.crop,
+                    land_size_acres: parseFloat(profile.land_size_acres) || 0
+                });
+
+            if (error) throw error;
+            alert("Profile updated successfully!");
+        } catch (error) {
+            console.error("Error updating profile:", error);
+            alert("Failed to update profile.");
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    if (loading) {
+        return (
+            <div className="flex h-64 items-center justify-center">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-mint"></div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-4 md:p-8 max-w-4xl mx-auto space-y-6">
+            <header className="relative z-50 flex flex-col mb-8">
+                <h1 className="text-2xl font-bold tracking-tight text-white mb-1">{t('accountFarmProfile')}</h1>
+                <p className="text-sm text-gray-400">{t('manageFarmData')}</p>
+            </header>
+
+            <GlassCard className="max-w-2xl">
+                <form onSubmit={handleSave} className="space-y-6 p-2">
+                    <div className="flex items-center space-x-4 mb-8 pb-8 border-b border-white/10">
+                        <div className="w-16 h-16 rounded-full bg-mint/10 border border-mint/30 flex items-center justify-center overflow-hidden">
+                            <span className="text-2xl text-mint font-bold">{profile.name ? profile.name.charAt(0).toUpperCase() : 'U'}</span>
+                        </div>
+                        <div>
+                            <h2 className="text-xl font-bold text-white">{profile.name || t('user') || 'User'}</h2>
+                            <span className="text-sm font-mono text-gray-400">{n(profile.phone)}</span>
+                            <span className="ml-3 inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-400 border border-green-500/20">
+                                {t('verified')}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium text-gray-400 block uppercase tracking-wider text-[11px]">{t('fullName')}</label>
+                            <input
+                                type="text"
+                                className="block w-full rounded-lg border border-white/10 bg-black/20 p-3 text-white focus:outline-none focus:ring-1 focus:ring-mint transition-colors"
+                                value={profile.name}
+                                onChange={(e) => setProfile(prev => ({ ...prev, name: e.target.value }))}
+                            />
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium text-gray-400 block uppercase tracking-wider text-[11px]">{t('phoneNumber')}</label>
+                            <input
+                                type="text"
+                                disabled
+                                className="block w-full rounded-lg border border-white/5 bg-black/40 p-3 text-gray-500 cursor-not-allowed"
+                                value={profile.phone}
+                            />
+                            <p className="text-[10px] text-gray-500 mt-1">{t('phoneWarning')}</p>
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium text-gray-400 block uppercase tracking-wider text-[11px]">{t('primaryCrop')}</label>
+                            <select
+                                className="block w-full rounded-lg border border-white/10 bg-black/20 p-3 text-white focus:outline-none focus:ring-1 focus:ring-mint transition-colors custom-select"
+                                value={profile.crop}
+                                onChange={(e) => setProfile(prev => ({ ...prev, crop: e.target.value }))}
+                            >
+                                <option value="" className="text-gray-900">{t('select')}</option>
+                                <option value="tomato" className="text-gray-900">{t('tomato') || 'Tomato'}</option>
+                                <option value="onion" className="text-gray-900">{t('onion') || 'Onion'}</option>
+                                <option value="potato" className="text-gray-900">{t('potato') || 'Potato'}</option>
+                            </select>
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium text-gray-400 block uppercase tracking-wider text-[11px]">{t('landSizeAcres')}</label>
+                            <input
+                                type="number"
+                                step="0.1"
+                                className="block w-full rounded-lg border border-white/10 bg-black/20 p-3 text-white focus:outline-none focus:ring-1 focus:ring-mint transition-colors"
+                                value={profile.land_size_acres}
+                                onChange={(e) => setProfile(prev => ({ ...prev, land_size_acres: e.target.value }))}
+                            />
+                        </div>
+                    </div>
+
+                    <div className="pt-6 mt-6 border-t border-white/10 flex justify-end">
+                        <button
+                            type="submit"
+                            disabled={saving}
+                            className="bg-mint text-forest font-bold py-2.5 px-6 rounded-lg transition-all hover:bg-white hover:shadow-[0_0_15px_rgba(32,255,189,0.3)] disabled:opacity-50"
+                        >
+                            {saving ? t('updating') : t('saveChanges')}
+                        </button>
+                    </div>
+                </form>
+            </GlassCard>
+
+            <GlassCard className="max-w-2xl border-red-500/20 bg-red-500/5">
+                <div className="p-2 space-y-4">
+                    <h3 className="text-sm font-bold text-red-400 uppercase tracking-widest">{t('deleteData' as any)}</h3>
+                    <p className="text-xs text-gray-400 leading-relaxed">
+                        {t('deleteDataDescription' as any)}
+                    </p>
+                    <button
+                        onClick={handleDeleteData}
+                        className="px-4 py-2 bg-red-500/10 border border-red-500/30 text-red-400 text-xs font-bold rounded-lg hover:bg-red-500 hover:text-white transition-all"
+                    >
+                        {t('deleteData' as any)}
+                    </button>
+                </div>
+            </GlassCard>
+        </div>
+    );
+}

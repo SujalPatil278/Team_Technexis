@@ -1,0 +1,9 @@
+{
+  "name": "AgriChain",
+  "short_name": "KrishiAI",
+  "description": "The Temporal Arbitrage Engine for Farmers",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1B3022",
+  "theme_color": "#20FFBD"
+}
